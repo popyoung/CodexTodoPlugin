@@ -26,6 +26,7 @@ Win10 / Win11 不内置 .NET 8 Runtime。
 - `todo help`：显示命令帮助。
 - `todo remove`：删除全部未完成待办。
 - `todo remove <序号>`：删除列表中对应序号的待办。
+- `<序号>`：如果存在对应待办，只显示该待办原文；不执行、不删除、不发送给模型。若序号不存在，则作为普通消息发送。
 
 ## 安装
 
@@ -72,6 +73,6 @@ artifacts\publish\win-x64\codex-todo.exe
 ## 说明
 
 - 命令刻意不使用 `/todo`，因为斜杠命令可能绕过 `UserPromptSubmit` 钩子。
-- 普通消息直接放行，不注入 `additionalContext`，也不返回 `systemMessage`。只有以 `todo` 开头的命令会被拦截并显示为 `Not sent`。
+- 普通消息直接放行，不注入 `additionalContext`，也不返回 `systemMessage`。以 `todo` 开头的命令会被拦截并显示为 `Not sent`；纯数字只有命中当前待办序号时才会被拦截为快速查看。
 - 默认不安装 `Stop` 钩子。`Stop` 提醒会额外触发续接轮次，速度更慢。
 - 运行态数据 `.codex-todo/` 已被 Git 忽略。

@@ -326,6 +326,7 @@ internal static class TodoHook
         var trimmed = prompt.Trim();
         var lower = trimmed.ToLowerInvariant();
         var isTodoCommand = Regex.IsMatch(lower, @"^todo(\s|$)");
+        var isNumberLookup = Regex.IsMatch(trimmed, @"^\d+$");
         var (command, argument) = ParseCommand(trimmed, lower);
 
         if (command == "help")
@@ -333,7 +334,7 @@ internal static class TodoHook
             return Block(UiText.Help);
         }
 
-        if (!isTodoCommand)
+        if (!isTodoCommand && !isNumberLookup)
         {
             return Continue();
         }
@@ -341,6 +342,11 @@ internal static class TodoHook
         using var stateLock = TodoStateStore.AcquireLock(paths.LockPath);
         var state = TodoStateStore.Read(paths.StatePath);
         state.PendingExecution = null;
+
+        if (isNumberLookup)
+        {
+            return ShowTodoByNumber(paths.StatePath, state, trimmed);
+        }
 
         switch (command)
         {
@@ -445,6 +451,25 @@ internal static class TodoHook
         state.PendingExecution = null;
         TodoStateStore.Save(statePath, state);
         return Block($"{UiText.Removed}{removedItem?.Text}\n\n{NewListMessage(GetOpenTodos(state))}");
+    }
+
+    private static object ShowTodoByNumber(string statePath, TodoState state, string argument)
+    {
+        if (!int.TryParse(argument, out var index))
+        {
+            TodoStateStore.Save(statePath, state);
+            return Continue();
+        }
+
+        var todos = GetOpenTodos(state);
+        if (index < 1 || index > todos.Count)
+        {
+            TodoStateStore.Save(statePath, state);
+            return Continue();
+        }
+
+        TodoStateStore.Save(statePath, state);
+        return Block(todos[index - 1].Text);
     }
 
     private static object Block(string reason) => new { decision = "block", reason };
