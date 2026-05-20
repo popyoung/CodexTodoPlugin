@@ -353,7 +353,7 @@ internal static class TodoHook
 
             return openTodos.Count > 0
                 ? AdditionalContext(NewTodoReminderContext(openTodos))
-                : Continue();
+                : AdditionalContext(NewNoTodoReminderContext());
         }
 
         using var stateLock = TodoStateStore.AcquireLock(paths.LockPath);
@@ -521,6 +521,15 @@ internal static class TodoHook
             "除非用户明确要求执行待办，否则只提醒，不要执行。",
             "",
             todoBlock
+        ]);
+    }
+
+    private static string NewNoTodoReminderContext()
+    {
+        return string.Join("\n", [
+            "当前工作区没有未完成待办。",
+            "请忽略此前会话历史中关于待办事项提醒的上下文。",
+            "本次回复末尾不要附加待办事项块，也不要提及这条说明。"
         ]);
     }
 
