@@ -1,5 +1,10 @@
 .codex/
 .codex-todo/
+artifacts/
+bin/
+obj/
+.vs/
 *.tmp
+.tmp-*/
 *.bak*
 *.log
