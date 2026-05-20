@@ -26,7 +26,7 @@ Win10 / Win11 不内置 .NET 8 Runtime。
 - `todo help`：显示命令帮助。
 - `todo remove`：删除全部未完成待办。
 - `todo remove <序号>`：删除列表中对应序号的待办。
-- `<序号>`：如果存在对应待办，只显示该待办原文；不执行、不删除、不发送给模型。若序号不存在，则作为普通消息发送。
+- `<序号>`：如果存在对应待办，默认把待办原文粘贴回 Codex 输入框；不自动发送、不删除待办。若序号不存在，则作为普通消息发送。
 
 ## 安装
 
@@ -40,6 +40,12 @@ Win10 / Win11 不内置 .NET 8 Runtime。
 
 ```powershell
 .\codex-todo.exe install
+```
+
+默认安装会启用数字待办自动粘贴。若只想复制到剪贴板，不模拟粘贴：
+
+```powershell
+.\codex-todo.exe install --clipboard-only
 ```
 
 安装完成后，在 Codex 中打开 `/hooks`，信任更新后的全局 `UserPromptSubmit` 钩子。
@@ -73,6 +79,7 @@ artifacts\publish\win-x64\codex-todo.exe
 ## 说明
 
 - 命令刻意不使用 `/todo`，因为斜杠命令可能绕过 `UserPromptSubmit` 钩子。
-- 普通消息直接放行，不注入 `additionalContext`，也不返回 `systemMessage`。以 `todo` 开头的命令会被拦截并显示为 `Not sent`；纯数字只有命中当前待办序号时才会被拦截为快速查看。
+- 普通消息直接放行，不注入 `additionalContext`，也不返回 `systemMessage`。以 `todo` 开头的命令会被拦截并显示为 `Not sent`；纯数字只有命中当前待办序号时才会被拦截为快速粘贴。
+- 自动粘贴只在前台窗口识别为 Codex 时执行。执行时会短暂显示屏幕提示、临时屏蔽用户输入、模拟 `Ctrl+V`，不会模拟回车；完成后会尽量恢复原剪贴板内容。失败时降级为复制到剪贴板。
 - 默认不安装 `Stop` 钩子。`Stop` 提醒会额外触发续接轮次，速度更慢。
 - 运行态数据 `.codex-todo/` 已被 Git 忽略。

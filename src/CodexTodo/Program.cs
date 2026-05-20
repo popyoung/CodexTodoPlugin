@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -28,10 +30,11 @@ internal static class Program
             TryConfigureConsoleEncoding();
 
             var command = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : "";
+            var options = HookOptions.FromArgs(args.Skip(1));
             return command switch
             {
-                "hook" => RunHook(),
-                "install" => InstallHooks(interactive: false),
+                "hook" => RunHook(options),
+                "install" => InstallHooks(interactive: false, options),
                 "uninstall" => UninstallHooks(interactive: false),
                 "status" => ShowStatus(),
                 "-h" or "--help" or "help" => ShowHelp(),
@@ -59,7 +62,7 @@ internal static class Program
         }
     }
 
-    private static int RunHook()
+    private static int RunHook(HookOptions options)
     {
         try
         {
@@ -83,7 +86,7 @@ internal static class Program
             var workspaceRoot = ResolveWorkspaceRoot(root);
             var paths = StatePaths.ForWorkspace(workspaceRoot);
             var prompt = GetPayloadString(root, "prompt") ?? "";
-            var output = TodoHook.HandleUserPromptSubmit(prompt, paths);
+            var output = TodoHook.HandleUserPromptSubmit(prompt, paths, options);
             WriteHookJson(output);
             return 0;
         }
@@ -124,7 +127,7 @@ internal static class Program
             switch (choice)
             {
                 case "1":
-                    InstallHooks(interactive: true);
+                    InstallHooks(interactive: true, HookOptions.Default);
                     break;
                 case "2":
                     UninstallHooks(interactive: true);
@@ -151,7 +154,9 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("用法：");
         Console.WriteLine("  codex-todo.exe             打开安装/卸载菜单");
-        Console.WriteLine("  codex-todo.exe install     安装全局 UserPromptSubmit hook");
+        Console.WriteLine("  codex-todo.exe install     安装全局 UserPromptSubmit hook，默认启用数字待办自动粘贴");
+        Console.WriteLine("  codex-todo.exe install --clipboard-only");
+        Console.WriteLine("                              安装 hook，但数字待办只复制到剪贴板");
         Console.WriteLine("  codex-todo.exe uninstall   卸载 Codex Todo hook");
         Console.WriteLine("  codex-todo.exe status      查看 hook 状态");
         Console.WriteLine("  codex-todo.exe hook        执行 Codex hook 协议处理");
@@ -165,15 +170,18 @@ internal static class Program
         return 2;
     }
 
-    private static int InstallHooks(bool interactive)
+    private static int InstallHooks(bool interactive, HookOptions options)
     {
         var hooksPath = GetHooksPath();
         var config = HooksConfig.Load(hooksPath);
         config.RemoveCodexTodoHooks();
-        config.AddUserPromptSubmitHook(BuildHookCommand());
+        config.AddUserPromptSubmitHook(BuildHookCommand(options));
         config.Save(hooksPath);
 
         Console.WriteLine($"已安装 Codex Todo hook：{hooksPath}");
+        Console.WriteLine(options.AutoPasteNumberLookup
+            ? "数字待办查找：自动粘贴已启用。"
+            : "数字待办查找：仅复制到剪贴板。");
         Console.WriteLine("请在 Codex 中打开 /hooks，并信任更新后的 hook。");
         return 0;
     }
@@ -216,7 +224,7 @@ internal static class Program
         return Path.Combine(profile, ".codex", "hooks.json");
     }
 
-    private static string BuildHookCommand()
+    private static string BuildHookCommand(HookOptions options)
     {
         var processPath = Environment.ProcessPath;
         if (!string.IsNullOrWhiteSpace(processPath) &&
@@ -225,7 +233,7 @@ internal static class Program
             var assemblyName = Assembly.GetEntryAssembly()?.GetName().Name
                 ?? throw new InvalidOperationException("无法定位当前程序集。");
             var assemblyPath = Path.Combine(AppContext.BaseDirectory, assemblyName + ".dll");
-            return $"dotnet \"{assemblyPath}\" hook";
+            return AppendHookOptions($"dotnet \"{assemblyPath}\" hook", options);
         }
 
         if (string.IsNullOrWhiteSpace(processPath))
@@ -233,7 +241,13 @@ internal static class Program
             throw new InvalidOperationException("无法定位当前可执行文件。");
         }
 
-        return NeedsQuoting(processPath) ? $"\"{processPath}\" hook" : $"{processPath} hook";
+        var command = NeedsQuoting(processPath) ? $"\"{processPath}\" hook" : $"{processPath} hook";
+        return AppendHookOptions(command, options);
+    }
+
+    private static string AppendHookOptions(string command, HookOptions options)
+    {
+        return options.AutoPasteNumberLookup ? command : command + " --clipboard-only";
     }
 
     private static bool NeedsQuoting(string path)
@@ -307,6 +321,45 @@ internal sealed class TodoItem
     public string Status { get; set; } = "open";
 }
 
+internal sealed record HookOptions(bool AutoPasteNumberLookup, bool DryRunTransfer)
+{
+    public static HookOptions Default { get; } = new(AutoPasteNumberLookup: true, DryRunTransfer: false);
+
+    public static HookOptions FromArgs(IEnumerable<string> args)
+    {
+        var autoPaste = Default.AutoPasteNumberLookup;
+        var dryRunTransfer = Default.DryRunTransfer;
+        foreach (var rawArg in args)
+        {
+            var arg = rawArg.Trim().ToLowerInvariant();
+            switch (arg)
+            {
+                case "--paste":
+                case "--auto-paste":
+                    autoPaste = true;
+                    break;
+                case "--clipboard-only":
+                case "--no-paste":
+                    autoPaste = false;
+                    break;
+                case "--dry-run-transfer":
+                    dryRunTransfer = true;
+                    break;
+            }
+        }
+
+        var env = Environment.GetEnvironmentVariable("CODEX_TODO_AUTO_PASTE");
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            autoPaste = !string.Equals(env, "0", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(env, "false", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(env, "no", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return new HookOptions(autoPaste, dryRunTransfer);
+    }
+}
+
 internal sealed record StatePaths(string StateDir, string StatePath, string LockPath)
 {
     public static StatePaths ForWorkspace(string workspaceRoot)
@@ -321,7 +374,7 @@ internal sealed record StatePaths(string StateDir, string StatePath, string Lock
 
 internal static class TodoHook
 {
-    public static object HandleUserPromptSubmit(string prompt, StatePaths paths)
+    public static object HandleUserPromptSubmit(string prompt, StatePaths paths, HookOptions options)
     {
         var trimmed = prompt.Trim();
         var lower = trimmed.ToLowerInvariant();
@@ -345,7 +398,7 @@ internal static class TodoHook
 
         if (isNumberLookup)
         {
-            return ShowTodoByNumber(paths.StatePath, state, trimmed);
+            return ShowTodoByNumber(paths.StatePath, state, trimmed, options);
         }
 
         switch (command)
@@ -453,7 +506,7 @@ internal static class TodoHook
         return Block($"{UiText.Removed}{removedItem?.Text}\n\n{NewListMessage(GetOpenTodos(state))}");
     }
 
-    private static object ShowTodoByNumber(string statePath, TodoState state, string argument)
+    private static object ShowTodoByNumber(string statePath, TodoState state, string argument, HookOptions options)
     {
         if (!int.TryParse(argument, out var index))
         {
@@ -469,7 +522,9 @@ internal static class TodoHook
         }
 
         TodoStateStore.Save(statePath, state);
-        return Block(todos[index - 1].Text);
+        var text = todos[index - 1].Text;
+        var result = TodoContentTransfer.Transfer(text, options);
+        return Block(result.Message);
     }
 
     private static object Block(string reason) => new { decision = "block", reason };
@@ -615,6 +670,806 @@ internal static class TodoHook
             .ToList();
         return removed;
     }
+}
+
+internal sealed record TransferResult(string Message);
+
+internal static class TodoContentTransfer
+{
+    public static TransferResult Transfer(string text, HookOptions options)
+    {
+        if (options.DryRunTransfer)
+        {
+            return new TransferResult($"dry-run：将粘贴待办内容，未自动发送：\n\n{text}");
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return new TransferResult(text);
+        }
+
+        ClipboardSnapshot? originalClipboard = null;
+        try
+        {
+            originalClipboard = ClipboardApi.Capture();
+            ClipboardApi.SetUnicodeText(text);
+        }
+        catch (Exception ex)
+        {
+            return new TransferResult($"无法写入剪贴板：{ex.Message}\n\n{text}");
+        }
+
+        if (!options.AutoPasteNumberLookup)
+        {
+            return new TransferResult($"已复制到剪贴板：\n\n{text}");
+        }
+
+        if (!ForegroundWindowGuard.IsCodexForeground(out var foregroundDescription))
+        {
+            return new TransferResult($"已复制到剪贴板，自动粘贴已跳过：前台窗口不是 Codex（{foregroundDescription}）。\n\n{text}");
+        }
+
+        try
+        {
+            NativeScreenTip.Show("正在粘贴待办内容，请勿操作", 900);
+            Thread.Sleep(80);
+
+            using var block = InputBlockScope.TryEnter();
+            if (!block.IsActive)
+            {
+                return new TransferResult($"已复制到剪贴板，自动粘贴已跳过：无法临时屏蔽用户输入。\n\n{text}");
+            }
+
+            Thread.Sleep(30);
+            KeyboardInput.PasteByKeybdEvent();
+            Thread.Sleep(160);
+        }
+        catch (Exception ex)
+        {
+            InputBlockScope.ReleaseAll();
+            return new TransferResult($"已复制到剪贴板，自动粘贴失败：{ex.Message}\n\n{text}");
+        }
+        finally
+        {
+            InputBlockScope.ReleaseAll();
+        }
+
+        Thread.Sleep(250);
+        TryRestoreClipboard(originalClipboard, text);
+        return new TransferResult($"已粘贴待办内容，未自动发送：\n\n{text}");
+    }
+
+    private static void TryRestoreClipboard(ClipboardSnapshot? originalClipboard, string pastedText)
+    {
+        if (originalClipboard is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var currentText = ClipboardApi.GetUnicodeText();
+            if (string.Equals(currentText, pastedText, StringComparison.Ordinal))
+            {
+                ClipboardApi.Restore(originalClipboard);
+            }
+        }
+        catch
+        {
+            // 恢复剪贴板失败不应影响 todo 命令结果。
+        }
+    }
+}
+
+internal sealed class InputBlockScope : IDisposable
+{
+    private static readonly object Gate = new();
+    private static int _activeCount;
+    private bool _disposed;
+
+    static InputBlockScope()
+    {
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => ReleaseAll();
+        AppDomain.CurrentDomain.UnhandledException += (_, _) => ReleaseAll();
+        Console.CancelKeyPress += (_, _) => ReleaseAll();
+    }
+
+    private InputBlockScope(bool isActive)
+    {
+        IsActive = isActive;
+    }
+
+    ~InputBlockScope()
+    {
+        Dispose();
+    }
+
+    public bool IsActive { get; }
+
+    public static InputBlockScope TryEnter()
+    {
+        lock (Gate)
+        {
+            if (_activeCount == 0 && !NativeMethods.BlockInput(true))
+            {
+                return new InputBlockScope(false);
+            }
+
+            _activeCount++;
+            return new InputBlockScope(true);
+        }
+    }
+
+    public static void ReleaseAll()
+    {
+        lock (Gate)
+        {
+            if (_activeCount <= 0)
+            {
+                return;
+            }
+
+            _activeCount = 0;
+            NativeMethods.BlockInput(false);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        if (!IsActive)
+        {
+            GC.SuppressFinalize(this);
+            return;
+        }
+
+        lock (Gate)
+        {
+            if (_activeCount > 0)
+            {
+                _activeCount--;
+                if (_activeCount == 0)
+                {
+                    NativeMethods.BlockInput(false);
+                }
+            }
+        }
+
+        GC.SuppressFinalize(this);
+    }
+}
+
+internal static class KeyboardInput
+{
+    private const byte VkControl = 0x11;
+    private const byte VkV = 0x56;
+    private const int KeyEventKeyUp = 0x0002;
+
+    public static void PasteByKeybdEvent()
+    {
+        NativeMethods.keybd_event(VkControl, 0, 0, 0);
+        NativeMethods.keybd_event(VkV, 0, 0, 0);
+        NativeMethods.keybd_event(VkV, 0, KeyEventKeyUp, 0);
+        NativeMethods.keybd_event(VkControl, 0, KeyEventKeyUp, 0);
+    }
+}
+
+internal static class ForegroundWindowGuard
+{
+    public static bool IsCodexForeground(out string description)
+    {
+        var hwnd = NativeMethods.GetForegroundWindow();
+        if (hwnd == IntPtr.Zero)
+        {
+            description = "无前台窗口";
+            return false;
+        }
+
+        var title = NativeMethods.GetWindowTitle(hwnd);
+        NativeMethods.GetWindowThreadProcessId(hwnd, out var processId);
+        var processName = "";
+        var processPath = "";
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            processName = process.ProcessName;
+            try
+            {
+                processPath = process.MainModule?.FileName ?? "";
+            }
+            catch
+            {
+                processPath = "";
+            }
+        }
+        catch
+        {
+            processName = $"pid {processId}";
+        }
+
+        description = string.IsNullOrWhiteSpace(title)
+            ? processName
+            : $"{processName} / {title}";
+
+        return ContainsCodex(processName)
+            || ContainsCodex(processPath)
+            || ContainsCodex(title);
+    }
+
+    private static bool ContainsCodex(string value)
+    {
+        return value.Contains("codex", StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal sealed record ClipboardSnapshot(List<ClipboardFormatData> Formats, bool HadAnyFormat);
+
+internal sealed record ClipboardFormatData(uint Format, byte[] Data);
+
+internal static class ClipboardApi
+{
+    private const uint CfUnicodeText = 13;
+    private const uint GmemMoveable = 0x0002;
+
+    public static ClipboardSnapshot Capture()
+    {
+        using var clipboard = ClipboardAccess.Open();
+        var formats = new List<ClipboardFormatData>();
+        var hadAnyFormat = false;
+        uint format = 0;
+        while ((format = NativeMethods.EnumClipboardFormats(format)) != 0)
+        {
+            hadAnyFormat = true;
+            var handle = NativeMethods.GetClipboardData(format);
+            if (handle == IntPtr.Zero)
+            {
+                continue;
+            }
+
+            var size = NativeMethods.GlobalSize(handle);
+            if (size == UIntPtr.Zero || size.ToUInt64() > int.MaxValue)
+            {
+                continue;
+            }
+
+            var pointer = NativeMethods.GlobalLock(handle);
+            if (pointer == IntPtr.Zero)
+            {
+                continue;
+            }
+
+            try
+            {
+                var data = new byte[(int)size.ToUInt64()];
+                Marshal.Copy(pointer, data, 0, data.Length);
+                formats.Add(new ClipboardFormatData(format, data));
+            }
+            finally
+            {
+                NativeMethods.GlobalUnlock(handle);
+            }
+        }
+
+        return new ClipboardSnapshot(formats, hadAnyFormat);
+    }
+
+    public static string? GetUnicodeText()
+    {
+        using var clipboard = ClipboardAccess.Open();
+        if (!NativeMethods.IsClipboardFormatAvailable(CfUnicodeText))
+        {
+            return null;
+        }
+
+        var handle = NativeMethods.GetClipboardData(CfUnicodeText);
+        if (handle == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        var pointer = NativeMethods.GlobalLock(handle);
+        if (pointer == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Marshal.PtrToStringUni(pointer);
+        }
+        finally
+        {
+            NativeMethods.GlobalUnlock(handle);
+        }
+    }
+
+    public static void SetUnicodeText(string text)
+    {
+        using var clipboard = ClipboardAccess.Open();
+        if (!NativeMethods.EmptyClipboard())
+        {
+            throw new InvalidOperationException("无法清空剪贴板。");
+        }
+
+        var data = Encoding.Unicode.GetBytes(text + "\0");
+        SetClipboardBytes(CfUnicodeText, data);
+    }
+
+    public static void Restore(ClipboardSnapshot snapshot)
+    {
+        if (snapshot.HadAnyFormat && snapshot.Formats.Count == 0)
+        {
+            return;
+        }
+
+        using var clipboard = ClipboardAccess.Open();
+        if (!NativeMethods.EmptyClipboard())
+        {
+            throw new InvalidOperationException("无法清空剪贴板。");
+        }
+
+        foreach (var format in snapshot.Formats)
+        {
+            SetClipboardBytes(format.Format, format.Data);
+        }
+    }
+
+    private static void SetClipboardBytes(uint format, byte[] data)
+    {
+        var handle = NativeMethods.GlobalAlloc(GmemMoveable, (UIntPtr)data.Length);
+        if (handle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("无法分配剪贴板内存。");
+        }
+
+        var pointer = NativeMethods.GlobalLock(handle);
+        if (pointer == IntPtr.Zero)
+        {
+            NativeMethods.GlobalFree(handle);
+            throw new InvalidOperationException("无法锁定剪贴板内存。");
+        }
+
+        try
+        {
+            Marshal.Copy(data, 0, pointer, data.Length);
+        }
+        finally
+        {
+            NativeMethods.GlobalUnlock(handle);
+        }
+
+        if (NativeMethods.SetClipboardData(format, handle) == IntPtr.Zero)
+        {
+            NativeMethods.GlobalFree(handle);
+            throw new InvalidOperationException("无法写入剪贴板数据。");
+        }
+    }
+}
+
+internal sealed class ClipboardAccess : IDisposable
+{
+    private ClipboardAccess()
+    {
+    }
+
+    public static ClipboardAccess Open()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            if (NativeMethods.OpenClipboard(IntPtr.Zero))
+            {
+                return new ClipboardAccess();
+            }
+
+            Thread.Sleep(25);
+        }
+
+        throw new InvalidOperationException("无法打开剪贴板。");
+    }
+
+    public void Dispose()
+    {
+        NativeMethods.CloseClipboard();
+    }
+}
+
+internal static class NativeScreenTip
+{
+    public static void Show(string text, int durationMs)
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                new NativeTipWindow(text, durationMs).Run();
+            }
+            catch
+            {
+                // 屏幕提示失败不影响粘贴流程。
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Codex Todo Tip"
+        };
+        if (OperatingSystem.IsWindows())
+        {
+            thread.SetApartmentState(ApartmentState.STA);
+        }
+        thread.Start();
+    }
+}
+
+internal sealed class NativeTipWindow
+{
+    private const int Width = 620;
+    private const int Height = 110;
+    private const uint WsPopup = 0x80000000;
+    private const uint WsExTopmost = 0x00000008;
+    private const uint WsExToolWindow = 0x00000080;
+    private const uint WsExNoActivate = 0x08000000;
+    private const uint WsExLayered = 0x00080000;
+    private const uint WsExTransparent = 0x00000020;
+    private const int SwShowNoActivate = 4;
+    private const int SmCxScreen = 0;
+    private const int SmCyScreen = 1;
+    private const uint WmPaint = 0x000F;
+    private const uint WmTimer = 0x0113;
+    private const uint WmDestroy = 0x0002;
+    private const uint LwaAlpha = 0x00000002;
+    private const int Transparent = 1;
+    private const uint DtCenter = 0x00000001;
+    private const uint DtVcenter = 0x00000004;
+    private const uint DtSingleLine = 0x00000020;
+
+    private readonly string _text;
+    private readonly int _durationMs;
+    private NativeMethods.WndProc? _wndProc;
+    private IntPtr _font;
+
+    public NativeTipWindow(string text, int durationMs)
+    {
+        _text = text;
+        _durationMs = durationMs;
+    }
+
+    public void Run()
+    {
+        _wndProc = WndProc;
+        var className = "CodexTodoTip_" + Guid.NewGuid().ToString("N");
+        var hInstance = NativeMethods.GetModuleHandle(null);
+        var wc = new NativeMethods.WNDCLASSEX
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEX>(),
+            lpfnWndProc = _wndProc,
+            hInstance = hInstance,
+            lpszClassName = className
+        };
+
+        NativeMethods.RegisterClassEx(ref wc);
+        var screenWidth = NativeMethods.GetSystemMetrics(SmCxScreen);
+        var screenHeight = NativeMethods.GetSystemMetrics(SmCyScreen);
+        var hwnd = NativeMethods.CreateWindowEx(
+            WsExTopmost | WsExToolWindow | WsExNoActivate | WsExLayered | WsExTransparent,
+            className,
+            "",
+            WsPopup,
+            Math.Max(0, (screenWidth - Width) / 2),
+            Math.Max(0, screenHeight / 4),
+            Width,
+            Height,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            hInstance,
+            IntPtr.Zero);
+
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        NativeMethods.SetLayeredWindowAttributes(hwnd, 0, 225, LwaAlpha);
+        NativeMethods.SetTimer(hwnd, new UIntPtr(1), (uint)_durationMs, IntPtr.Zero);
+        NativeMethods.ShowWindow(hwnd, SwShowNoActivate);
+        NativeMethods.UpdateWindow(hwnd);
+
+        while (NativeMethods.GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
+        {
+            NativeMethods.TranslateMessage(ref message);
+            NativeMethods.DispatchMessage(ref message);
+        }
+
+        if (_font != IntPtr.Zero)
+        {
+            NativeMethods.DeleteObject(_font);
+            _font = IntPtr.Zero;
+        }
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        switch (message)
+        {
+            case WmPaint:
+                Paint(hwnd);
+                return IntPtr.Zero;
+            case WmTimer:
+                NativeMethods.DestroyWindow(hwnd);
+                return IntPtr.Zero;
+            case WmDestroy:
+                NativeMethods.PostQuitMessage(0);
+                return IntPtr.Zero;
+            default:
+                return NativeMethods.DefWindowProc(hwnd, message, wParam, lParam);
+        }
+    }
+
+    private void Paint(IntPtr hwnd)
+    {
+        var hdc = NativeMethods.BeginPaint(hwnd, out var ps);
+        try
+        {
+            NativeMethods.GetClientRect(hwnd, out var rect);
+            var brush = NativeMethods.CreateSolidBrush(0x202020);
+            try
+            {
+                NativeMethods.FillRect(hdc, ref rect, brush);
+            }
+            finally
+            {
+                NativeMethods.DeleteObject(brush);
+            }
+
+            _font = _font == IntPtr.Zero
+                ? NativeMethods.CreateFontW(-34, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, "Microsoft YaHei")
+                : _font;
+            var oldFont = NativeMethods.SelectObject(hdc, _font);
+            NativeMethods.SetBkMode(hdc, Transparent);
+            NativeMethods.SetTextColor(hdc, 0xFFFFFF);
+            NativeMethods.DrawTextW(hdc, _text, -1, ref rect, DtCenter | DtVcenter | DtSingleLine);
+            NativeMethods.SelectObject(hdc, oldFont);
+        }
+        finally
+        {
+            NativeMethods.EndPaint(hwnd, ref ps);
+        }
+    }
+}
+
+internal static class NativeMethods
+{
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate IntPtr WndProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct WNDCLASSEX
+    {
+        public uint cbSize;
+        public uint style;
+        public WndProc lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public string? lpszMenuName;
+        public string lpszClassName;
+        public IntPtr hIconSm;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public UIntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public POINT pt;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PAINTSTRUCT
+    {
+        public IntPtr hdc;
+        public bool fErase;
+        public RECT rcPaint;
+        public bool fRestore;
+        public bool fIncUpdate;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] rgbReserved;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool BlockInput(bool fBlockIt);
+
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+    public static string GetWindowTitle(IntPtr hwnd)
+    {
+        var length = GetWindowTextLengthW(hwnd);
+        if (length <= 0)
+        {
+            return "";
+        }
+
+        var builder = new StringBuilder(length + 1);
+        GetWindowTextW(hwnd, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetClipboardData(uint uFormat);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsClipboardFormatAvailable(uint format);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint EnumClipboardFormats(uint format);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GlobalUnlock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern UIntPtr GlobalSize(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalFree(IntPtr hMem);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern ushort RegisterClassEx(ref WNDCLASSEX lpwcx);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWindowEx(
+        uint dwExStyle,
+        string lpClassName,
+        string lpWindowName,
+        uint dwStyle,
+        int x,
+        int y,
+        int nWidth,
+        int nHeight,
+        IntPtr hWndParent,
+        IntPtr hMenu,
+        IntPtr hInstance,
+        IntPtr lpParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern bool UpdateWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll")]
+    public static extern bool DestroyWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern void PostQuitMessage(int nExitCode);
+
+    [DllImport("user32.dll")]
+    public static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    public static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr DispatchMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr BeginPaint(IntPtr hwnd, out PAINTSTRUCT lpPaint);
+
+    [DllImport("user32.dll")]
+    public static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateSolidBrush(uint color);
+
+    [DllImport("user32.dll")]
+    public static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteObject(IntPtr hObject);
+
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFontW(
+        int cHeight,
+        int cWidth,
+        int cEscapement,
+        int cOrientation,
+        int cWeight,
+        uint bItalic,
+        uint bUnderline,
+        uint bStrikeOut,
+        uint iCharSet,
+        uint iOutPrecision,
+        uint iClipPrecision,
+        uint iQuality,
+        uint iPitchAndFamily,
+        string pszFaceName);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+
+    [DllImport("gdi32.dll")]
+    public static extern int SetBkMode(IntPtr hdc, int mode);
+
+    [DllImport("gdi32.dll")]
+    public static extern uint SetTextColor(IntPtr hdc, uint color);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int DrawTextW(IntPtr hdc, string lpchText, int cchText, ref RECT lprc, uint format);
 }
 
 internal static class TodoStateStore
