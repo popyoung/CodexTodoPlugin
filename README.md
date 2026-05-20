@@ -26,7 +26,6 @@ Win10 / Win11 不内置 .NET 8 Runtime。
 - `todo help`：显示命令帮助。
 - `todo remove`：删除全部未完成待办。
 - `todo remove <序号>`：删除列表中对应序号的待办。
-- `<序号>`：删除对应待办，并把待办原文作为当前请求交给 Codex 处理。
 
 ## 安装
 
@@ -73,7 +72,6 @@ artifacts\publish\win-x64\codex-todo.exe
 ## 说明
 
 - 命令刻意不使用 `/todo`，因为斜杠命令可能绕过 `UserPromptSubmit` 钩子。
-- 如果当前工作区有未完成待办，普通消息会通过 `UserPromptSubmit` 给模型附加提醒上下文，要求回复末尾按 `待办事项：` 加编号列表的固定格式提醒。todo 命令会在进入模型前返回 `decision: "block"`，因此响应更快。
-- 如果当前工作区的待办已清空，普通消息会附加一小段隐藏上下文，要求模型忽略旧会话历史里的过期待办提醒，避免同一会话继续显示已删除内容。
+- 普通消息直接放行，不注入 `additionalContext`，也不返回 `systemMessage`。只有以 `todo` 开头的命令会被拦截并显示为 `Not sent`。
 - 默认不安装 `Stop` 钩子。`Stop` 提醒会额外触发续接轮次，速度更慢。
 - 运行态数据 `.codex-todo/` 已被 Git 忽略。

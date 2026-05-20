@@ -325,7 +325,7 @@ internal static class TodoHook
     {
         var trimmed = prompt.Trim();
         var lower = trimmed.ToLowerInvariant();
-        var isTodoCommand = Regex.IsMatch(lower, @"^todo(\s|$)") || Regex.IsMatch(lower, @"^\d+$");
+        var isTodoCommand = Regex.IsMatch(lower, @"^todo(\s|$)");
         var (command, argument) = ParseCommand(trimmed, lower);
 
         if (command == "help")
@@ -335,25 +335,7 @@ internal static class TodoHook
 
         if (!isTodoCommand)
         {
-            if (!File.Exists(paths.StatePath))
-            {
-                return Continue();
-            }
-
-            using var readLock = TodoStateStore.AcquireLock(paths.LockPath);
-            var existingState = TodoStateStore.Read(paths.StatePath);
-            var clearedPending = existingState.PendingExecution is not null;
-            existingState.PendingExecution = null;
-            var openTodos = GetOpenTodos(existingState);
-
-            if (clearedPending)
-            {
-                TodoStateStore.Save(paths.StatePath, existingState);
-            }
-
-            return openTodos.Count > 0
-                ? AdditionalContext(NewTodoReminderContext(openTodos))
-                : AdditionalContext(NewNoTodoReminderContext());
+            return Continue();
         }
 
         using var stateLock = TodoStateStore.AcquireLock(paths.LockPath);
@@ -371,7 +353,8 @@ internal static class TodoHook
             case "remove":
                 return RemoveTodos(paths.StatePath, state, argument);
             case "do":
-                return SelectTodo(paths.StatePath, state, argument);
+                TodoStateStore.Save(paths.StatePath, state);
+                return Block(UiText.DoRemoved);
             default:
                 TodoStateStore.Save(paths.StatePath, state);
                 return Block(UiText.Usage);
@@ -402,7 +385,7 @@ internal static class TodoHook
             };
         }
 
-        return Regex.IsMatch(lower, @"^\d+$") ? ("do", lower) : ("", "");
+        return ("", "");
     }
 
     private static object Continue() => new { @continue = true };
@@ -464,74 +447,7 @@ internal static class TodoHook
         return Block($"{UiText.Removed}{removedItem?.Text}\n\n{NewListMessage(GetOpenTodos(state))}");
     }
 
-    private static object SelectTodo(string statePath, TodoState state, string argument)
-    {
-        if (!int.TryParse(argument, out var index))
-        {
-            TodoStateStore.Save(statePath, state);
-            return Block(UiText.Usage);
-        }
-
-        var todos = GetOpenTodos(state);
-        if (index < 1 || index > todos.Count)
-        {
-            TodoStateStore.Save(statePath, state);
-            return Block($"{UiText.OutOfRange}\n\n{NewListMessage(todos)}");
-        }
-
-        var removed = RemoveTodoById(state, todos[index - 1].Id);
-        state.PendingExecution = null;
-        TodoStateStore.Save(statePath, state);
-
-        var context = string.Join("\n", [
-            $"用户选择了工作区 todo 第 {index} 项。选中的 todo 已经从 .codex-todo/todos.json 中删除。",
-            "",
-            "请把下面的 todo 原文当作用户当前请求来处理：",
-            removed?.Text ?? "",
-            "",
-            "按正常 Codex 工作流程回答或执行。除非 todo 本身要求讨论实现思路，否则不要转成实现思路讨论。"
-        ]);
-
-        return AdditionalContext(context);
-    }
-
     private static object Block(string reason) => new { decision = "block", reason };
-
-    private static object AdditionalContext(string context)
-    {
-        return new
-        {
-            hookSpecificOutput = new
-            {
-                hookEventName = "UserPromptSubmit",
-                additionalContext = context
-            }
-        };
-    }
-
-    private static string NewTodoReminderContext(IReadOnlyList<TodoItem> todos)
-    {
-        var todoBlock = $"待办事项：\n{FormatTodoList(todos)}";
-
-        return string.Join("\n", [
-            "当前工作区有未完成待办。",
-            "请正常回答用户当前问题。",
-            "在回复最后另起一段，原样追加下面的待办事项块。",
-            "不要合并、改写、统计、压缩或改成一句话。",
-            "除非用户明确要求执行待办，否则只提醒，不要执行。",
-            "",
-            todoBlock
-        ]);
-    }
-
-    private static string NewNoTodoReminderContext()
-    {
-        return string.Join("\n", [
-            "当前工作区没有未完成待办。",
-            "请忽略此前会话历史中关于待办事项提醒的上下文。",
-            "本次回复末尾不要附加待办事项块，也不要提及这条说明。"
-        ]);
-    }
 
     private static List<TodoItem> GetOpenTodos(TodoState state)
     {
@@ -751,7 +667,8 @@ internal static class UiText
     public const string OutOfRange = "序号超出范围。";
     public const string RemoveAllEmpty = "没有可删除的待办。";
     public const string RemoveUsage = "请使用 todo remove 或 todo remove 1。";
-    public const string Usage = "todo <内容>\ntodo list\ntodo remove [序号]\n<序号>";
+    public const string DoRemoved = "todo do 已停用。请先用 todo 查看待办，然后把要处理的待办内容作为普通消息发送。";
+    public const string Usage = "todo <内容>\ntodo list\ntodo remove [序号]\ntodo help";
     public const string Help = """
 Codex Todo 用法：
 
@@ -770,9 +687,6 @@ todo remove
 
 todo remove <序号>
   删除指定序号的待办。
-
-<序号>
-  删除对应待办，并把待办原文作为当前请求交给 Codex 处理。
 
 todo help
   显示这段帮助。
