@@ -1,0 +1,20 @@
+{
+  "name": "codex-todo-local",
+  "interface": {
+    "displayName": "Codex Todo 本地版"
+  },
+  "plugins": [
+    {
+      "name": "codex-todo",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

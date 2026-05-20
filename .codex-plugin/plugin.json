@@ -1,0 +1,38 @@
+{
+  "name": "codex-todo",
+  "version": "0.1.0",
+  "description": "Codex 工作区级待办命令。",
+  "author": {
+    "name": "popyoung"
+  },
+  "homepage": "https://developers.openai.com/codex/hooks",
+  "repository": "local",
+  "license": "MIT",
+  "keywords": [
+    "todo",
+    "tasks",
+    "hooks",
+    "productivity"
+  ],
+  "interface": {
+    "displayName": "Codex Todo",
+    "shortDescription": "在 Codex 中管理工作区待办",
+    "longDescription": "通过工作区本地状态和 Codex UserPromptSubmit hook 提供快速 todo 命令。",
+    "developerName": "popyoung",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://developers.openai.com/codex/hooks",
+    "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
+    "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
+    "defaultPrompt": [
+      "todo 审查当前改动",
+      "todo list",
+      "1"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

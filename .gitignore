@@ -1,0 +1,5 @@
+.codex/
+.codex-todo/
+*.tmp
+*.bak*
+*.log
