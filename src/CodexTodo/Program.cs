@@ -521,8 +521,10 @@ internal static class TodoHook
             return Continue();
         }
 
+        var removed = RemoveTodoById(state, todos[index - 1].Id);
+        state.PendingExecution = null;
         TodoStateStore.Save(statePath, state);
-        var text = todos[index - 1].Text;
+        var text = removed?.Text ?? todos[index - 1].Text;
         var result = TodoContentTransfer.Transfer(text, options);
         return Block(result.Message);
     }
