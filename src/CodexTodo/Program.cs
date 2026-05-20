@@ -709,20 +709,29 @@ internal static class TodoContentTransfer
             return new TransferResult($"已复制到剪贴板，自动粘贴已跳过：前台窗口不是 Codex（{foregroundDescription}）。\n\n{text}");
         }
 
+        var pasteWarning = "";
         try
         {
             NativeScreenTip.Show("正在粘贴待办内容，请勿操作", 900);
             Thread.Sleep(80);
 
             using var block = InputBlockScope.TryEnter();
+            var inputBlocked = block.IsActive;
             if (!block.IsActive)
             {
-                return new TransferResult($"已复制到剪贴板，自动粘贴已跳过：无法临时屏蔽用户输入。\n\n{text}");
+                if (!ForegroundWindowGuard.IsCodexForeground(out foregroundDescription))
+                {
+                    return new TransferResult($"已复制到剪贴板，自动粘贴已跳过：无法临时屏蔽用户输入，且前台窗口已不是 Codex（{foregroundDescription}）。\n\n{text}");
+                }
             }
 
             Thread.Sleep(30);
             KeyboardInput.PasteByKeybdEvent();
             Thread.Sleep(160);
+            if (!inputBlocked)
+            {
+                pasteWarning = "未能临时屏蔽用户输入，但已复核前台窗口并尝试粘贴。";
+            }
         }
         catch (Exception ex)
         {
@@ -736,7 +745,9 @@ internal static class TodoContentTransfer
 
         Thread.Sleep(250);
         TryRestoreClipboard(originalClipboard, text);
-        return new TransferResult($"已粘贴待办内容，未自动发送：\n\n{text}");
+        return new TransferResult(string.IsNullOrWhiteSpace(pasteWarning)
+            ? $"已粘贴待办内容，未自动发送：\n\n{text}"
+            : $"已粘贴待办内容，未自动发送。{pasteWarning}\n\n{text}");
     }
 
     private static void TryRestoreClipboard(ClipboardSnapshot? originalClipboard, string pastedText)
