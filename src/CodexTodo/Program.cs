@@ -1166,13 +1166,14 @@ internal sealed class NativeTipWindow
         NativeMethods.RegisterClassEx(ref wc);
         var screenWidth = NativeMethods.GetSystemMetrics(SmCxScreen);
         var screenHeight = NativeMethods.GetSystemMetrics(SmCyScreen);
+        var top = Math.Max(0, screenHeight - Height - 220);
         var hwnd = NativeMethods.CreateWindowEx(
             WsExTopmost | WsExToolWindow | WsExNoActivate | WsExLayered | WsExTransparent,
             className,
             "",
             WsPopup,
             Math.Max(0, (screenWidth - Width) / 2),
-            Math.Max(0, screenHeight / 4),
+            top,
             Width,
             Height,
             IntPtr.Zero,
