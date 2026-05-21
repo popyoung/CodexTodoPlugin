@@ -34,6 +34,7 @@ internal static class Program
             return command switch
             {
                 "hook" => RunHook(options),
+                "tip" => RunTip(args.Skip(1)),
                 "install" => InstallHooks(interactive: false, options),
                 "uninstall" => UninstallHooks(interactive: false),
                 "status" => ShowStatus(),
@@ -95,6 +96,74 @@ internal static class Program
             WriteHookJson(new { decision = "block", reason = "Codex Todo hook 运行失败：\n\n" + ex.Message });
             return 0;
         }
+    }
+
+    private static int RunTip(IEnumerable<string> args)
+    {
+        var text = "";
+        var durationMs = 0;
+        var targetWindow = IntPtr.Zero;
+        List<TipTodoItem>? clickItems = null;
+        var statePath = "";
+        var lockPath = "";
+        var pendingOption = "";
+
+        foreach (var rawArg in args)
+        {
+            if (string.IsNullOrEmpty(pendingOption))
+            {
+                pendingOption = rawArg switch
+                {
+                    "--text-base64" => rawArg,
+                    "--duration-ms" => rawArg,
+                    "--target-window" => rawArg,
+                    "--items-base64" => rawArg,
+                    "--state-path-base64" => rawArg,
+                    "--lock-path-base64" => rawArg,
+                    _ => ""
+                };
+                continue;
+            }
+
+            if (pendingOption == "--text-base64")
+            {
+                text = Encoding.UTF8.GetString(Convert.FromBase64String(rawArg));
+            }
+            else if (pendingOption == "--duration-ms")
+            {
+                _ = int.TryParse(rawArg, out durationMs);
+            }
+            else if (pendingOption == "--target-window")
+            {
+                if (long.TryParse(rawArg, out var rawHandle))
+                {
+                    targetWindow = new IntPtr(rawHandle);
+                }
+            }
+            else if (pendingOption == "--items-base64")
+            {
+                var json = Encoding.UTF8.GetString(Convert.FromBase64String(rawArg));
+                clickItems = JsonSerializer.Deserialize<List<TipTodoItem>>(json, JsonOptions);
+            }
+            else if (pendingOption == "--state-path-base64")
+            {
+                statePath = Encoding.UTF8.GetString(Convert.FromBase64String(rawArg));
+            }
+            else if (pendingOption == "--lock-path-base64")
+            {
+                lockPath = Encoding.UTF8.GetString(Convert.FromBase64String(rawArg));
+            }
+
+            pendingOption = "";
+        }
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return 2;
+        }
+
+        NativeScreenTip.ShowModal(text, durationMs, targetWindow, clickItems, statePath, lockPath);
+        return 0;
     }
 
     private static string ReadStandardInputUtf8()
@@ -321,6 +390,10 @@ internal sealed class TodoItem
     public string Status { get; set; } = "open";
 }
 
+internal sealed record TipTodoItem(
+    [property: JsonPropertyName("id")] int Id,
+    [property: JsonPropertyName("text")] string Text);
+
 internal sealed record HookOptions(bool AutoPasteNumberLookup, bool DryRunTransfer)
 {
     public static HookOptions Default { get; } = new(AutoPasteNumberLookup: true, DryRunTransfer: false);
@@ -384,6 +457,7 @@ internal static class TodoHook
 
         if (command == "help")
         {
+            NativeScreenTip.ShowDetached(UiText.Help, 0);
             return Block(UiText.Help);
         }
 
@@ -407,8 +481,16 @@ internal static class TodoHook
                 return AddTodos(paths.StatePath, state, argument);
             case "list":
                 state.PendingExecution = null;
+                var openTodos = GetOpenTodos(state);
+                var listMessage = NewListMessage(openTodos);
                 TodoStateStore.Save(paths.StatePath, state);
-                return Block(NewListMessage(GetOpenTodos(state)));
+                NativeScreenTip.ShowDetached(
+                    NewListTipMessage(openTodos),
+                    0,
+                    openTodos.Select(todo => new TipTodoItem(todo.Id, todo.Text)).ToList(),
+                    paths.StatePath,
+                    paths.LockPath);
+                return Block(listMessage);
             case "remove":
                 return RemoveTodos(paths.StatePath, state, argument);
             case "do":
@@ -541,6 +623,11 @@ internal static class TodoHook
     private static string NewListMessage(IReadOnlyList<TodoItem> todos)
     {
         return $"{UiText.CurrentTodos}\n\n{FormatTodoList(todos)}";
+    }
+
+    private static string NewListTipMessage(IReadOnlyList<TodoItem> todos)
+    {
+        return $"{NewListMessage(todos)}\n\n点击或按 Esc 关闭";
     }
 
     private static string FormatTodoList(IReadOnlyList<TodoItem> todos)
@@ -714,9 +801,6 @@ internal static class TodoContentTransfer
         var pasteWarning = "";
         try
         {
-            NativeScreenTip.Show("正在粘贴待办内容，请勿操作", 900);
-            Thread.Sleep(80);
-
             using var block = InputBlockScope.TryEnter();
             var inputBlocked = block.IsActive;
             if (!block.IsActive)
@@ -1094,21 +1178,94 @@ internal sealed class ClipboardAccess : IDisposable
 
 internal static class NativeScreenTip
 {
-    public static void Show(string text, int durationMs)
+    public static void ShowDetached(
+        string text,
+        int durationMs,
+        IReadOnlyList<TipTodoItem>? clickItems = null,
+        string statePath = "",
+        string lockPath = "")
+    {
+        try
+        {
+            var targetWindow = NativeMethods.GetForegroundWindow();
+            var executablePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrWhiteSpace(executablePath)
+                || string.Equals(Path.GetFileName(executablePath), "dotnet.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                var candidate = Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "codex-todo.exe" : "codex-todo");
+                executablePath = File.Exists(candidate) ? candidate : executablePath;
+            }
+
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                return;
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executablePath,
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            startInfo.ArgumentList.Add("tip");
+            startInfo.ArgumentList.Add("--text-base64");
+            startInfo.ArgumentList.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(text)));
+            startInfo.ArgumentList.Add("--duration-ms");
+            startInfo.ArgumentList.Add(durationMs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (targetWindow != IntPtr.Zero)
+            {
+                startInfo.ArgumentList.Add("--target-window");
+                startInfo.ArgumentList.Add(targetWindow.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            if (clickItems is { Count: > 0 })
+            {
+                startInfo.ArgumentList.Add("--items-base64");
+                var itemsJson = JsonSerializer.Serialize(clickItems, ProgramStateJson.Options);
+                startInfo.ArgumentList.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(itemsJson)));
+            }
+
+            if (!string.IsNullOrWhiteSpace(statePath))
+            {
+                startInfo.ArgumentList.Add("--state-path-base64");
+                startInfo.ArgumentList.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(statePath)));
+            }
+
+            if (!string.IsNullOrWhiteSpace(lockPath))
+            {
+                startInfo.ArgumentList.Add("--lock-path-base64");
+                startInfo.ArgumentList.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(lockPath)));
+            }
+
+            Process.Start(startInfo)?.Dispose();
+        }
+        catch
+        {
+            // 桌面提示失败不影响 hook 主流程。
+        }
+    }
+
+    public static void ShowModal(
+        string text,
+        int durationMs,
+        IntPtr targetWindow = default,
+        IReadOnlyList<TipTodoItem>? clickItems = null,
+        string statePath = "",
+        string lockPath = "")
     {
         var thread = new Thread(() =>
         {
             try
             {
-                new NativeTipWindow(text, durationMs).Run();
+                new NativeTipWindow(text, durationMs, targetWindow, clickItems, statePath, lockPath).Run();
             }
             catch
             {
-                // 屏幕提示失败不影响粘贴流程。
+                // 桌面提示失败不影响调用方。
             }
         })
         {
-            IsBackground = true,
+            IsBackground = false,
             Name = "Codex Todo Tip"
         };
         if (OperatingSystem.IsWindows())
@@ -1116,40 +1273,94 @@ internal static class NativeScreenTip
             thread.SetApartmentState(ApartmentState.STA);
         }
         thread.Start();
+        thread.Join();
     }
 }
 
 internal sealed class NativeTipWindow
 {
-    private const int Width = 620;
-    private const int Height = 110;
+    private const int SingleLineWidth = 620;
+    private const int MultiLineWidth = 760;
+    private const int MinHeight = 110;
+    private const int ScreenVerticalMargin = 90;
+    private const int BottomOffset = 220;
+    private const int TextPaddingX = 28;
+    private const int TextPaddingTop = 22;
+    private const int MultiLineLineHeight = 34;
+    private const int DenseLineHeight = 28;
+    private const int FirstTodoLineIndex = 2;
     private const uint WsPopup = 0x80000000;
     private const uint WsExTopmost = 0x00000008;
     private const uint WsExToolWindow = 0x00000080;
-    private const uint WsExNoActivate = 0x08000000;
     private const uint WsExLayered = 0x00080000;
-    private const uint WsExTransparent = 0x00000020;
-    private const int SwShowNoActivate = 4;
+    private const int SwShow = 5;
     private const int SmCxScreen = 0;
     private const int SmCyScreen = 1;
+    private const int VkEscape = 0x1B;
+    private const int IdcArrow = 32512;
+    private const int WaInactive = 0;
+    private const uint WmActivate = 0x0006;
+    private const uint WmActivateApp = 0x001C;
+    private const uint WmSetCursor = 0x0020;
     private const uint WmPaint = 0x000F;
     private const uint WmTimer = 0x0113;
     private const uint WmDestroy = 0x0002;
+    private const uint WmKeyDown = 0x0100;
+    private const uint WmLButtonDown = 0x0201;
     private const uint LwaAlpha = 0x00000002;
     private const int Transparent = 1;
+    private const uint DtLeft = 0x00000000;
+    private const uint DtTop = 0x00000000;
     private const uint DtCenter = 0x00000001;
     private const uint DtVcenter = 0x00000004;
+    private const uint DtWordBreak = 0x00000010;
     private const uint DtSingleLine = 0x00000020;
+    private const uint DtNoPrefix = 0x00000800;
 
     private readonly string _text;
     private readonly int _durationMs;
+    private readonly bool _isMultiLine;
+    private readonly int _width;
+    private readonly int _height;
+    private readonly int _fontHeight;
+    private readonly int _lineHeight;
+    private readonly IntPtr _targetWindow;
+    private readonly IReadOnlyList<TipTodoItem> _clickItems;
+    private readonly string _statePath;
+    private readonly string _lockPath;
     private NativeMethods.WndProc? _wndProc;
     private IntPtr _font;
+    private bool _isPastingClickedItem;
 
-    public NativeTipWindow(string text, int durationMs)
+    public NativeTipWindow(
+        string text,
+        int durationMs,
+        IntPtr targetWindow = default,
+        IReadOnlyList<TipTodoItem>? clickItems = null,
+        string statePath = "",
+        string lockPath = "")
     {
         _text = text;
         _durationMs = durationMs;
+        _targetWindow = targetWindow;
+        _clickItems = clickItems ?? [];
+        _statePath = statePath;
+        _lockPath = lockPath;
+        var lineCount = Math.Max(1, text.Replace("\r\n", "\n").Split('\n').Length);
+        _isMultiLine = lineCount > 1;
+        var isClickableList = _clickItems.Count > 0;
+        _lineHeight = _isMultiLine
+            ? isClickableList ? MultiLineLineHeight : lineCount > 12 ? DenseLineHeight : MultiLineLineHeight
+            : MinHeight;
+        _width = _isMultiLine ? MultiLineWidth : SingleLineWidth;
+        var screenHeight = NativeMethods.GetSystemMetrics(SmCyScreen);
+        var maxHeight = Math.Max(MinHeight, screenHeight - ScreenVerticalMargin);
+        _height = _isMultiLine
+            ? Math.Clamp(54 + lineCount * _lineHeight, MinHeight, maxHeight)
+            : MinHeight;
+        _fontHeight = _isMultiLine
+            ? isClickableList ? -26 : lineCount > 12 ? -21 : -26
+            : -34;
     }
 
     public void Run()
@@ -1162,22 +1373,23 @@ internal sealed class NativeTipWindow
             cbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEX>(),
             lpfnWndProc = _wndProc,
             hInstance = hInstance,
+            hCursor = NativeMethods.LoadCursor(IntPtr.Zero, new IntPtr(IdcArrow)),
             lpszClassName = className
         };
 
         NativeMethods.RegisterClassEx(ref wc);
         var screenWidth = NativeMethods.GetSystemMetrics(SmCxScreen);
         var screenHeight = NativeMethods.GetSystemMetrics(SmCyScreen);
-        var top = Math.Max(0, screenHeight - Height - 220);
+        var top = Math.Max(0, screenHeight - _height - BottomOffset);
         var hwnd = NativeMethods.CreateWindowEx(
-            WsExTopmost | WsExToolWindow | WsExNoActivate | WsExLayered | WsExTransparent,
+            WsExTopmost | WsExToolWindow | WsExLayered,
             className,
             "",
             WsPopup,
-            Math.Max(0, (screenWidth - Width) / 2),
+            Math.Max(0, (screenWidth - _width) / 2),
             top,
-            Width,
-            Height,
+            _width,
+            _height,
             IntPtr.Zero,
             IntPtr.Zero,
             hInstance,
@@ -1189,8 +1401,12 @@ internal sealed class NativeTipWindow
         }
 
         NativeMethods.SetLayeredWindowAttributes(hwnd, 0, 225, LwaAlpha);
-        NativeMethods.SetTimer(hwnd, new UIntPtr(1), (uint)_durationMs, IntPtr.Zero);
-        NativeMethods.ShowWindow(hwnd, SwShowNoActivate);
+        if (_durationMs > 0)
+        {
+            NativeMethods.SetTimer(hwnd, new UIntPtr(1), (uint)_durationMs, IntPtr.Zero);
+        }
+        NativeMethods.ShowWindow(hwnd, SwShow);
+        NativeMethods.SetForegroundWindow(hwnd);
         NativeMethods.UpdateWindow(hwnd);
 
         while (NativeMethods.GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
@@ -1210,17 +1426,83 @@ internal sealed class NativeTipWindow
     {
         switch (message)
         {
+            case WmSetCursor:
+                NativeMethods.SetCursor(NativeMethods.LoadCursor(IntPtr.Zero, new IntPtr(IdcArrow)));
+                return (IntPtr)1;
+            case WmActivate:
+                if (_isMultiLine
+                    && !_isPastingClickedItem
+                    && (wParam.ToInt64() & 0xFFFF) == WaInactive)
+                {
+                    NativeMethods.DestroyWindow(hwnd);
+                    return IntPtr.Zero;
+                }
+
+                return NativeMethods.DefWindowProc(hwnd, message, wParam, lParam);
+            case WmActivateApp:
+                if (_isMultiLine && !_isPastingClickedItem && wParam == IntPtr.Zero)
+                {
+                    NativeMethods.DestroyWindow(hwnd);
+                    return IntPtr.Zero;
+                }
+
+                return NativeMethods.DefWindowProc(hwnd, message, wParam, lParam);
             case WmPaint:
                 Paint(hwnd);
                 return IntPtr.Zero;
             case WmTimer:
                 NativeMethods.DestroyWindow(hwnd);
                 return IntPtr.Zero;
+            case WmLButtonDown:
+                _ = TryPasteClickedItem(lParam);
+                NativeMethods.DestroyWindow(hwnd);
+                return IntPtr.Zero;
+            case WmKeyDown:
+                if (wParam == (IntPtr)VkEscape)
+                {
+                    NativeMethods.DestroyWindow(hwnd);
+                    return IntPtr.Zero;
+                }
+
+                return NativeMethods.DefWindowProc(hwnd, message, wParam, lParam);
             case WmDestroy:
                 NativeMethods.PostQuitMessage(0);
                 return IntPtr.Zero;
             default:
                 return NativeMethods.DefWindowProc(hwnd, message, wParam, lParam);
+        }
+    }
+
+    private bool TryPasteClickedItem(IntPtr lParam)
+    {
+        if (!_isMultiLine || _targetWindow == IntPtr.Zero || _clickItems.Count == 0)
+        {
+            return false;
+        }
+
+        var y = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
+        var lineIndex = (y - TextPaddingTop) / _lineHeight;
+        var itemIndex = lineIndex - FirstTodoLineIndex;
+        if (itemIndex < 0 || itemIndex >= _clickItems.Count)
+        {
+            return false;
+        }
+
+        _isPastingClickedItem = true;
+        try
+        {
+            var item = _clickItems[itemIndex];
+            var pasted = NativeTextInput.PasteTextToWindow(_targetWindow, item.Text);
+            if (pasted)
+            {
+                TipTodoDeletion.DeleteOpenTodo(_statePath, _lockPath, item.Id);
+            }
+
+            return pasted;
+        }
+        finally
+        {
+            _isPastingClickedItem = false;
         }
     }
 
@@ -1241,17 +1523,114 @@ internal sealed class NativeTipWindow
             }
 
             _font = _font == IntPtr.Zero
-                ? NativeMethods.CreateFontW(-34, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, "Microsoft YaHei")
+                ? NativeMethods.CreateFontW(_fontHeight, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, "Microsoft YaHei")
                 : _font;
             var oldFont = NativeMethods.SelectObject(hdc, _font);
             NativeMethods.SetBkMode(hdc, Transparent);
             NativeMethods.SetTextColor(hdc, 0xFFFFFF);
-            NativeMethods.DrawTextW(hdc, _text, -1, ref rect, DtCenter | DtVcenter | DtSingleLine);
+            var flags = _isMultiLine
+                ? DtLeft | DtTop | DtWordBreak | DtNoPrefix
+                : DtCenter | DtVcenter | DtSingleLine | DtNoPrefix;
+            if (_isMultiLine)
+            {
+                rect.Left += TextPaddingX;
+                rect.Top += TextPaddingTop;
+                rect.Right -= TextPaddingX;
+                rect.Bottom -= TextPaddingTop;
+            }
+
+            NativeMethods.DrawTextW(hdc, _text, -1, ref rect, flags);
             NativeMethods.SelectObject(hdc, oldFont);
         }
         finally
         {
             NativeMethods.EndPaint(hwnd, ref ps);
+        }
+    }
+}
+
+internal static class NativeTextInput
+{
+    public static bool PasteTextToWindow(IntPtr targetWindow, string text)
+    {
+        if (targetWindow == IntPtr.Zero || string.IsNullOrEmpty(text) || !NativeMethods.IsWindow(targetWindow))
+        {
+            return false;
+        }
+
+        ClipboardSnapshot? originalClipboard = null;
+        try
+        {
+            originalClipboard = ClipboardApi.Capture();
+            ClipboardApi.SetUnicodeText(text);
+            NativeMethods.SetForegroundWindow(targetWindow);
+            Thread.Sleep(140);
+            KeyboardInput.PasteByKeybdEvent();
+            Thread.Sleep(180);
+            TryRestoreClipboard(originalClipboard, text);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            InputBlockScope.ReleaseAll();
+        }
+    }
+
+    private static void TryRestoreClipboard(ClipboardSnapshot? originalClipboard, string pastedText)
+    {
+        if (originalClipboard is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var currentText = ClipboardApi.GetUnicodeText();
+            if (string.Equals(currentText, pastedText, StringComparison.Ordinal))
+            {
+                ClipboardApi.Restore(originalClipboard);
+            }
+        }
+        catch
+        {
+            // 恢复剪贴板失败不影响点击填入。
+        }
+    }
+}
+
+internal static class TipTodoDeletion
+{
+    public static void DeleteOpenTodo(string statePath, string lockPath, int todoId)
+    {
+        if (string.IsNullOrWhiteSpace(statePath)
+            || string.IsNullOrWhiteSpace(lockPath)
+            || todoId <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var stateLock = TodoStateStore.AcquireLock(lockPath);
+            var state = TodoStateStore.Read(statePath);
+            var index = state.Items.FindIndex(item =>
+                item.Id == todoId && string.Equals(item.Status, "open", StringComparison.Ordinal));
+            if (index < 0)
+            {
+                return;
+            }
+
+            state.Items.RemoveAt(index);
+            state.PendingExecution = null;
+            TodoStateStore.Save(statePath, state);
+        }
+        catch
+        {
+            // 删除失败时保留 todo，避免误删。
         }
     }
 }
@@ -1322,6 +1701,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
@@ -1410,6 +1792,15 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetCursor(IntPtr hCursor);
 
     [DllImport("user32.dll")]
     public static extern bool UpdateWindow(IntPtr hWnd);
@@ -1562,7 +1953,7 @@ internal static class UiText
     public const string RemoveAllEmpty = "没有可删除的待办。";
     public const string RemoveUsage = "请使用 todo remove 或 todo remove 1。";
     public const string DoRemoved = "todo do 已停用。请先用 todo 查看待办，然后把要处理的待办内容作为普通消息发送。";
-    public const string Usage = "todo <内容>\ntodo list\ntodo remove [序号]\ntodo help";
+    public const string Usage = "todo <内容>\ntodo list\n<数字>\ntodo remove [序号]\ntodo help";
     public const string Help = """
 Codex Todo 用法：
 
@@ -1571,7 +1962,10 @@ todo <内容>
 
 todo
 todo list
-  显示当前未完成待办。
+  用桌面提示窗显示当前未完成待办；点击某条会把内容粘贴到 Codex 输入框，并在粘贴成功后删除该待办。
+
+<数字>
+  直接输入列表中的序号，例如 1，会把对应待办粘贴到 Codex 输入框，并删除该待办。
 
 todo 后接多行内容
   按非空行批量添加；每行开头的 1、1.、1、 、（1）、-、* 等列表前缀会自动省略。
