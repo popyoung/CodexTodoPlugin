@@ -1280,15 +1280,13 @@ internal static class NativeScreenTip
 internal sealed class NativeTipWindow
 {
     private const int SingleLineWidth = 620;
-    private const int MultiLineWidth = 760;
+    private const int MultiLineWidth = 920;
     private const int MinHeight = 110;
     private const int ScreenVerticalMargin = 90;
     private const int BottomOffset = 220;
     private const int TextPaddingX = 28;
     private const int TextPaddingTop = 22;
     private const int MultiLineLineHeight = 34;
-    private const int DenseLineHeight = 28;
-    private const int FirstTodoLineIndex = 2;
     private const uint WsPopup = 0x80000000;
     private const uint WsExTopmost = 0x00000008;
     private const uint WsExToolWindow = 0x00000080;
@@ -1315,22 +1313,28 @@ internal sealed class NativeTipWindow
     private const uint DtVcenter = 0x00000004;
     private const uint DtWordBreak = 0x00000010;
     private const uint DtSingleLine = 0x00000020;
+    private const uint DtCalcRect = 0x00000400;
     private const uint DtNoPrefix = 0x00000800;
 
-    private readonly string _text;
+    private readonly string _displayText;
     private readonly int _durationMs;
     private readonly bool _isMultiLine;
     private readonly int _width;
     private readonly int _height;
     private readonly int _fontHeight;
-    private readonly int _lineHeight;
+    private readonly int _contentHeight;
     private readonly IntPtr _targetWindow;
     private readonly IReadOnlyList<TipTodoItem> _clickItems;
+    private readonly IReadOnlyList<ClickHitArea> _clickHitAreas;
     private readonly string _statePath;
     private readonly string _lockPath;
     private NativeMethods.WndProc? _wndProc;
     private IntPtr _font;
     private bool _isPastingClickedItem;
+
+    private readonly record struct FontProfile(int FontHeight);
+
+    private readonly record struct ClickHitArea(TipTodoItem Item, int Top, int Bottom);
 
     public NativeTipWindow(
         string text,
@@ -1340,7 +1344,6 @@ internal sealed class NativeTipWindow
         string statePath = "",
         string lockPath = "")
     {
-        _text = text;
         _durationMs = durationMs;
         _targetWindow = targetWindow;
         _clickItems = clickItems ?? [];
@@ -1349,18 +1352,212 @@ internal sealed class NativeTipWindow
         var lineCount = Math.Max(1, text.Replace("\r\n", "\n").Split('\n').Length);
         _isMultiLine = lineCount > 1;
         var isClickableList = _clickItems.Count > 0;
-        _lineHeight = _isMultiLine
-            ? isClickableList ? MultiLineLineHeight : lineCount > 12 ? DenseLineHeight : MultiLineLineHeight
-            : MinHeight;
-        _width = _isMultiLine ? MultiLineWidth : SingleLineWidth;
+        var screenWidth = NativeMethods.GetSystemMetrics(SmCxScreen);
         var screenHeight = NativeMethods.GetSystemMetrics(SmCyScreen);
+        _width = _isMultiLine
+            ? Math.Min(MultiLineWidth, Math.Max(320, screenWidth - 80))
+            : Math.Min(SingleLineWidth, Math.Max(320, screenWidth - 80));
         var maxHeight = Math.Max(MinHeight, screenHeight - ScreenVerticalMargin);
-        _height = _isMultiLine
-            ? Math.Clamp(54 + lineCount * _lineHeight, MinHeight, maxHeight)
-            : MinHeight;
-        _fontHeight = _isMultiLine
-            ? isClickableList ? -26 : lineCount > 12 ? -21 : -26
-            : -34;
+        if (_isMultiLine)
+        {
+            var textWidth = Math.Max(120, _width - TextPaddingX * 2);
+            var maxContentHeight = Math.Max(MultiLineLineHeight, maxHeight - TextPaddingTop * 2);
+            var profile = SelectFontProfile(text, textWidth, lineCount, isClickableList, maxHeight);
+            _fontHeight = profile.FontHeight;
+            _displayText = FitTextToHeight(text, textWidth, _fontHeight, maxContentHeight);
+            _contentHeight = MeasureTextHeight(_displayText, textWidth, _fontHeight);
+            _height = Math.Clamp(_contentHeight + TextPaddingTop * 2, MinHeight, maxHeight);
+            _clickHitAreas = BuildClickHitAreas(textWidth, _fontHeight);
+        }
+        else
+        {
+            _displayText = text;
+            _fontHeight = -34;
+            _contentHeight = MinHeight - TextPaddingTop * 2;
+            _height = MinHeight;
+            _clickHitAreas = [];
+        }
+    }
+
+    private static FontProfile SelectFontProfile(
+        string text,
+        int textWidth,
+        int lineCount,
+        bool isClickableList,
+        int maxHeight)
+    {
+        var profiles = GetFontProfiles(lineCount, isClickableList);
+        var selected = profiles[0];
+
+        foreach (var profile in profiles)
+        {
+            var measuredHeight = MeasureTextHeight(text, textWidth, profile.FontHeight);
+            selected = profile;
+            if (measuredHeight + TextPaddingTop * 2 <= maxHeight)
+            {
+                break;
+            }
+        }
+
+        return selected;
+    }
+
+    private static string FitTextToHeight(string text, int textWidth, int fontHeight, int maxContentHeight)
+    {
+        if (MeasureTextHeight(text, textWidth, fontHeight) <= maxContentHeight)
+        {
+            return text;
+        }
+
+        var normalized = text.Replace("\r\n", "\n");
+        var lines = normalized.Split('\n');
+        var low = 0;
+        var high = lines.Length;
+        var best = 0;
+
+        while (low <= high)
+        {
+            var mid = low + (high - low) / 2;
+            var candidate = BuildEllipsizedText(lines, mid);
+            if (MeasureTextHeight(candidate, textWidth, fontHeight) <= maxContentHeight)
+            {
+                best = mid;
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return BuildEllipsizedText(lines, best);
+    }
+
+    private static string BuildEllipsizedText(string[] lines, int visibleLineCount)
+    {
+        if (visibleLineCount <= 0)
+        {
+            return "...";
+        }
+
+        var prefix = string.Join("\n", lines.Take(visibleLineCount)).TrimEnd();
+        return string.IsNullOrWhiteSpace(prefix)
+            ? "..."
+            : prefix + "\n...";
+    }
+
+    private static FontProfile[] GetFontProfiles(int lineCount, bool isClickableList)
+    {
+        if (isClickableList)
+        {
+            return
+            [
+                new FontProfile(-26),
+                new FontProfile(-23),
+                new FontProfile(-20)
+            ];
+        }
+
+        return lineCount > 12
+            ?
+            [
+                new FontProfile(-21),
+                new FontProfile(-18),
+                new FontProfile(-16)
+            ]
+            :
+            [
+                new FontProfile(-26),
+                new FontProfile(-21),
+                new FontProfile(-18)
+            ];
+    }
+
+    private IReadOnlyList<ClickHitArea> BuildClickHitAreas(int textWidth, int fontHeight)
+    {
+        if (_clickItems.Count == 0)
+        {
+            return [];
+        }
+
+        var areas = new List<ClickHitArea>(_clickItems.Count);
+        var lines = _displayText.Replace("\r\n", "\n").Split('\n');
+        for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+        {
+            var match = Regex.Match(lines[lineIndex], @"^\s*(\d+)\.\s");
+            if (!match.Success
+                || !int.TryParse(match.Groups[1].Value, out var displayIndex)
+                || displayIndex < 1
+                || displayIndex > _clickItems.Count)
+            {
+                continue;
+            }
+
+            var top = TextPaddingTop + MeasureTopForLine(lines, lineIndex, textWidth, fontHeight);
+            var bottom = TextPaddingTop + MeasureTopForLine(lines, lineIndex + 1, textWidth, fontHeight);
+            if (bottom <= top)
+            {
+                bottom = top + MeasureTextHeight(lines[lineIndex], textWidth, fontHeight);
+            }
+
+            areas.Add(new ClickHitArea(
+                _clickItems[displayIndex - 1],
+                Math.Max(TextPaddingTop, top - 8),
+                bottom + 10));
+        }
+
+        return areas;
+    }
+
+    private static int MeasureTopForLine(string[] lines, int lineIndex, int textWidth, int fontHeight)
+    {
+        if (lineIndex <= 0)
+        {
+            return 0;
+        }
+
+        var prefix = string.Join("\n", lines.Take(lineIndex));
+        var probeHeight = MeasureTextHeight(prefix + "\nX", textWidth, fontHeight);
+        var probeLineHeight = MeasureTextHeight("X", textWidth, fontHeight);
+        return Math.Max(0, probeHeight - probeLineHeight);
+    }
+
+    private static int MeasureTextHeight(string text, int textWidth, int fontHeight)
+    {
+        var hdc = NativeMethods.GetDC(IntPtr.Zero);
+        if (hdc == IntPtr.Zero)
+        {
+            return Math.Max(MultiLineLineHeight, text.Replace("\r\n", "\n").Split('\n').Length * MultiLineLineHeight);
+        }
+
+        var font = NativeMethods.CreateFontW(fontHeight, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, "Microsoft YaHei");
+        var oldFont = font == IntPtr.Zero ? IntPtr.Zero : NativeMethods.SelectObject(hdc, font);
+        try
+        {
+            var rect = new NativeMethods.RECT
+            {
+                Left = 0,
+                Top = 0,
+                Right = textWidth,
+                Bottom = 0
+            };
+            NativeMethods.DrawTextW(hdc, text, -1, ref rect, DtLeft | DtTop | DtWordBreak | DtNoPrefix | DtCalcRect);
+            return Math.Max(MultiLineLineHeight, rect.Bottom - rect.Top);
+        }
+        finally
+        {
+            if (oldFont != IntPtr.Zero)
+            {
+                NativeMethods.SelectObject(hdc, oldFont);
+            }
+
+            if (font != IntPtr.Zero)
+            {
+                NativeMethods.DeleteObject(font);
+            }
+
+            NativeMethods.ReleaseDC(IntPtr.Zero, hdc);
+        }
     }
 
     public void Run()
@@ -1481,9 +1678,8 @@ internal sealed class NativeTipWindow
         }
 
         var y = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
-        var lineIndex = (y - TextPaddingTop) / _lineHeight;
-        var itemIndex = lineIndex - FirstTodoLineIndex;
-        if (itemIndex < 0 || itemIndex >= _clickItems.Count)
+        var hitArea = _clickHitAreas.FirstOrDefault(area => y >= area.Top && y < area.Bottom);
+        if (hitArea.Item is null)
         {
             return false;
         }
@@ -1491,7 +1687,7 @@ internal sealed class NativeTipWindow
         _isPastingClickedItem = true;
         try
         {
-            var item = _clickItems[itemIndex];
+            var item = hitArea.Item;
             var pasted = NativeTextInput.PasteTextToWindow(_targetWindow, item.Text);
             if (pasted)
             {
@@ -1536,10 +1732,10 @@ internal sealed class NativeTipWindow
                 rect.Left += TextPaddingX;
                 rect.Top += TextPaddingTop;
                 rect.Right -= TextPaddingX;
-                rect.Bottom -= TextPaddingTop;
+                rect.Bottom = Math.Min(rect.Bottom - TextPaddingTop, rect.Top + _contentHeight);
             }
 
-            NativeMethods.DrawTextW(hdc, _text, -1, ref rect, flags);
+            NativeMethods.DrawTextW(hdc, _displayText, -1, ref rect, flags);
             NativeMethods.SelectObject(hdc, oldFont);
         }
         finally
@@ -1565,6 +1761,11 @@ internal static class NativeTextInput
             ClipboardApi.SetUnicodeText(text);
             NativeMethods.SetForegroundWindow(targetWindow);
             Thread.Sleep(140);
+            if (NativeMethods.GetForegroundWindow() != targetWindow)
+            {
+                return false;
+            }
+
             KeyboardInput.PasteByKeybdEvent();
             Thread.Sleep(180);
             TryRestoreClipboard(originalClipboard, text);
@@ -1834,6 +2035,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
 
     [DllImport("user32.dll")]
     public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
